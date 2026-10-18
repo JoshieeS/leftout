@@ -1,7 +1,12 @@
 import { createElement, type ReactNode } from 'react';
 import Link from 'next/link';
 
-type Props = { href: string; className?: string; children: ReactNode; external?: boolean };
+type Props = {
+  href: string;
+  className?: string;
+  children?: ReactNode; // optional: createElement passes children as extra arguments
+  external?: boolean;
+};
 
 export function TextLink({ href, className, children, external = false }: Props) {
   if (external) {

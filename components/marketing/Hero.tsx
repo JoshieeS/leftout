@@ -1,5 +1,6 @@
 import {TextLink} from '@/components/ui/TextLink'
 import { DropVisual } from './DropVisual';
+import { createElement } from 'react';
 
 export function Hero() {
   return (
@@ -16,12 +17,12 @@ export function Hero() {
         </p>
 
         <div className="flex flex-wrap items-center gap-4">
-          <TextLink href="/app" className="border border-accent bg-accent px-5 py-3 text-bg transition-colors hover:bg-transparent hover:text-accent">
-            start sharing →
-          </TextLink>
-          <TextLink href="#how" className="text-dim hover:text-fg">
-            see how it works ↓
-          </TextLink>
+          {createElement(
+            TextLink,
+            { href: '/app', className: 'bg-accent px-6 py-3 text-bg transition-opacity hover:opacity-90' },
+            'start sharing →'
+          )}
+          {createElement(TextLink, { href: '#how', className: 'text-dim hover:text-fg' }, 'see how it works ↓')}
         </div>
 
         <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-dim">
