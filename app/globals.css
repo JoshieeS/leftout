@@ -23,3 +23,14 @@ html { color-scheme: dark; }
 }
 
 ::selection { background: var(--color-accent); color: var(--color-bg); }
+
+@keyframes fill { 0% { width: 6% } 70%, 100% { width: 100% } }
+.animate-fill { animation: fill 5s ease-in-out infinite; }
+
+@keyframes flow { to { stroke-dashoffset: -16 } }
+.animate-flow { animation: flow 0.8s linear infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fill { animation: none; width: 72%; }
+  .animate-flow { animation: none; }
+}
