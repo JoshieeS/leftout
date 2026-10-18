@@ -1,5 +1,7 @@
 import { Navbar } from '@/components/marketing/Navbar';
 import { Hero } from '@/components/marketing/Hero';
+import { Story } from '@/components/marketing/Story';
+import { HowItWorks } from '@/components/marketing/HowItWorks';
 
 export default function Landing() {
   return (
@@ -7,7 +9,8 @@ export default function Landing() {
       <Navbar />
       <main>
         <Hero />
-        {/* Front page 2: story + how it works */}
+        <Story />
+        <HowItWorks />
         {/* Front page 3: privacy, compatibility, CTA, footer */}
       </main>
     </>

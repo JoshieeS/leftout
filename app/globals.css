@@ -34,3 +34,8 @@ html { color-scheme: dark; }
   .animate-fill { animation: none; width: 72%; }
   .animate-flow { animation: none; }
 }
+
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}

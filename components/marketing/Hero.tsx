@@ -1,4 +1,4 @@
-import Link from 'next/link';
+import {TextLink} from '@/components/ui/TextLink'
 import { DropVisual } from './DropVisual';
 
 export function Hero() {
@@ -16,15 +16,12 @@ export function Hero() {
         </p>
 
         <div className="flex flex-wrap items-center gap-4">
-          <Link
-            href="/app"
-            className="border border-accent bg-accent px-5 py-3 text-bg transition-colors hover:bg-transparent hover:text-accent"
-          >
+          <TextLink href="/app" className="border border-accent bg-accent px-5 py-3 text-bg transition-colors hover:bg-transparent hover:text-accent">
             start sharing →
-          </Link>
-          <a href="#how" className="text-dim hover:text-fg">
+          </TextLink>
+          <TextLink href="#how" className="text-dim hover:text-fg">
             see how it works ↓
-          </a>
+          </TextLink>
         </div>
 
         <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-dim">
