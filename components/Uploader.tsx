@@ -12,12 +12,20 @@ import { makeSlug } from '@/lib/slug';
 import { traceConnection } from '@/lib/diagnostics';
 import { fileId, parseMsg, pickChunkSize, sendMsg, typeOf, type FileMeta, type Want } from '@/lib/protocol';
 import { sendFiles } from '@/lib/send';
-import { clearSenderSession, loadSenderSession, saveSenderSession, type SenderSession } from '@/lib/dropstore';
+import {
+  clearSenderSession,
+  loadSenderSession,
+  needsResume,
+  saveSenderSession,
+  type SenderSession,
+} from '@/lib/dropstore';
 import { useWakeLock } from '@/lib/usewakeLock';
 import { useVisibilityLog } from '@/lib/useVisibilityLog';
 
+type Lvl = 'info' | 'ok' | 'warn' | 'err';
 const keyOf = (f: File) => `${f.name}-${f.size}-${f.lastModified}`;
 const DAY = 24 * 60 * 60 * 1000;
+const RECLAIM_MS = 60000; // how long to keep trying to get the old link back
 
 type Phase = 'idle' | 'starting' | 'hosting';
 type PeerInfo = {
@@ -28,7 +36,6 @@ type PeerInfo = {
 };
 const blank: PeerInfo = { state: 'connecting', sent: 0, total: 0, verified: 0 };
 
-// Stable ids (same file → same id next time), made unique within the drop.
 function withIds(files: File[]) {
   const seen = new Map<string, number>();
   return files.map((file) => {
@@ -49,10 +56,14 @@ export function Uploader() {
   const { lines, log } = useLog();
 
   const peerRef = useRef<Peer | null>(null);
+  const hostGen = useRef(0); // bumps on start/stop so stale timers and peers do nothing
+  const slugRef = useRef('');
   const filesRef = useRef(new Map<string, File>());
   const manifestRef = useRef<FileMeta[]>([]);
-  const verifiedRef = useRef(new Map<string, Set<string>>()); // receiver → verified file ids
-  const connsRef = useRef(new Map<string, DataConnection>()); // receiver → live connection
+  const verifiedRef = useRef(new Map<string, Set<string>>());
+  const connsRef = useRef(new Map<string, DataConnection>());
+  const pendingRef = useRef(new Set<string>());
+  const doneRef = useRef(new Set<string>());
 
   const update = (key: string, patch: Partial<PeerInfo>) =>
     setPeers((prev) => {
@@ -61,11 +72,33 @@ export function Uploader() {
       return next;
     });
 
-  // Offer to resume an unfinished drop from the last 24 hours.
+  const saveSession = () => {
+    if (!slugRef.current) return;
+    saveSenderSession({
+      slug: slugRef.current,
+      ids: manifestRef.current.map((f) => f.id),
+      pending: [...pendingRef.current],
+      done: doneRef.current.size,
+    });
+  };
+
+  // Record whether this receiver still needs files. Returns true if it has everything.
+  const track = (key: string, verified: Set<string>) => {
+    const all = verified.size >= manifestRef.current.length;
+    if (all) {
+      pendingRef.current.delete(key);
+      doneRef.current.add(key);
+    } else {
+      pendingRef.current.add(key);
+    }
+    saveSession();
+    return all;
+  };
+
+  // Only offer to resume drops that were actually left unfinished.
   useEffect(() => {
     const s = loadSenderSession();
-    if (!s) return;
-    if (Date.now() - s.updated < DAY) setResume(s);
+    if (s && Date.now() - s.updated < DAY && needsResume(s)) setResume(s);
     else clearSenderSession();
   }, []);
 
@@ -88,8 +121,12 @@ export function Uploader() {
       size: t.file.size,
       type: typeOf(t.file.name, t.file.type),
     }));
+    pendingRef.current.clear();
+    doneRef.current.clear();
 
-    const wanted = resume?.slug;
+    const my = ++hostGen.current;
+    const alive = () => hostGen.current === my;
+    const wanted = resume?.slug ?? null;
     if (resume) {
       const matched = tagged.filter((t) => resume.ids.includes(t.id)).length;
       log(`resuming ${resume.slug} · ${matched}/${resume.ids.length} original files matched`, matched ? 'ok' : 'warn');
@@ -98,69 +135,102 @@ export function Uploader() {
     setPhase('starting');
     log('requesting peer id…');
     const mod = await import('peerjs');
+    if (!alive()) return;
 
-    const open = (attempt = 0) => {
-      const useOld = !!wanted && attempt < 5;
-      if (wanted && attempt === 5) log('old link unavailable · made a new one, share the new QR', 'warn');
-      const peer = new mod.Peer(useOld ? wanted : makeSlug(), { config: { iceServers: ICE_SERVERS } });
+    let deadline = Date.now() + RECLAIM_MS;
+    let waitLogged = false;
+
+    const open = (slug: string | null) => {
+      if (!alive()) return;
+      const peer = new mod.Peer(slug ?? makeSlug(), { config: { iceServers: ICE_SERVERS } });
 
       peer.on('open', (id) => {
+        if (!alive()) return peer.destroy();
         peerRef.current = peer;
+        slugRef.current = id;
         setLink(`${window.location.origin}/d/${id}`);
         setPhase('hosting');
         setResume(null);
-        saveSenderSession({ slug: id, ids: manifestRef.current.map((f) => f.id) });
+        saveSession();
         log(`listening as ${id}`, 'ok');
       });
 
-      peer.on('connection', serve);
+      peer.on('connection', (c) => {
+        if (alive()) serve(c);
+        else c.close();
+      });
 
+      // Lost the signaling server: open channels keep working, just re-register.
       peer.on('disconnected', () => {
-        if (peer.destroyed) return;
-        log('signaling server lost, reconnecting…', 'warn');
-        peer.reconnect();
+        if (!alive() || peer.destroyed) return;
+        try {
+          peer.reconnect();
+        } catch {
+          // the 5s heal loop retries
+        }
+      });
+
+      // Destroyed unexpectedly (fatal signaling error): reopen the same link.
+      peer.on('close', () => {
+        if (!alive() || peerRef.current !== peer) return;
+        peerRef.current = null;
+        log('signaling connection lost · reopening the same link', 'warn');
+        deadline = Date.now() + RECLAIM_MS;
+        setTimeout(() => open(slugRef.current || null), 2000);
       });
 
       peer.on('error', (err) => {
-        if (err.type === 'unavailable-id' && attempt < 8) {
-          peer.destroy();
-          if (useOld) {
-            log('previous session still closing · retrying in 3s', 'warn');
-            setTimeout(() => open(attempt + 1), 3000);
+        if (!alive()) return;
+        if (err.type === 'unavailable-id') {
+          peer.destroy(); // peerRef isn't this peer, so its 'close' is ignored
+          if (slug && Date.now() < deadline) {
+            if (!waitLogged) log('old link still registered · waiting for it to free up (up to 60s)', 'warn');
+            waitLogged = true;
+            setTimeout(() => open(slug), 3000);
           } else {
-            log('id taken, retrying…', 'warn');
-            open(attempt + 1);
+            if (slug) log('could not get the old link back · made a new one, share the new QR', 'warn');
+            open(null);
           }
           return;
         }
-        log(`error: ${err.type}`, 'err');
+        if (err.type === 'peer-unavailable') return; // not relevant for the sender
+        log(`signaling: ${err.type}`, 'warn');
       });
     };
-    open();
+
+    open(wanted);
   }
 
   function serve(conn: DataConnection) {
     const key = (conn.metadata as { client?: string } | undefined)?.client ?? conn.connectionId;
     const who = `peer ${key.slice(0, 6)}`;
-    const count = () => manifestRef.current.length;
     const verified = verifiedRef.current.get(key) ?? new Set<string>();
     verifiedRef.current.set(key, verified);
+
+    // Register the new connection *before* closing the old one,
+    // so the old one's close event knows it has been replaced.
+    const prev = connsRef.current.get(key);
+    connsRef.current.set(key, conn);
+    prev?.close();
+
+    const current = () => connsRef.current.get(key) === conn;
+    const clog = (m: string, l?: Lvl) => {
+      if (current()) log(m, l);
+    };
     let busy = false;
     let queued: Want[] | null = null;
 
-    connsRef.current.get(key)?.close(); // a reconnect replaces the old connection
-    connsRef.current.set(key, conn);
-    const current = () => connsRef.current.get(key) === conn;
-
     update(key, { state: 'connecting', verified: verified.size });
-    log(`${who} connecting…`);
-    traceConnection(conn, log);
+    clog(prev ? `${who} reconnecting…` : `${who} connecting…`);
+    traceConnection(conn, clog);
 
     conn.on('open', () => {
+      if (!current()) return;
       conn.dataChannel.binaryType = 'arraybuffer';
-      update(key, { state: verified.size >= count() ? 'done' : 'connected' });
+      const all = track(key, verified);
+      update(key, { state: all ? 'done' : 'connected' });
       sendMsg(conn.dataChannel, { kind: 'manifest', files: manifestRef.current });
-      log(`manifest sent to ${who} (${count()} files)`, 'ok');
+      clog(`manifest sent to ${who} (${manifestRef.current.length} files)`, 'ok');
     });
 
     async function run(want: Want[]) {
@@ -171,7 +241,7 @@ export function Uploader() {
       update(key, { state: 'sending', sent: already, total });
 
       const chunk = pickChunkSize(conn.peerConnection);
-      log(
+      clog(
         `sending ${want.length} file${want.length === 1 ? '' : 's'} to ${who}` +
           (already ? ` · resuming, ${formatBytes(already)} already there` : '') +
           ` · chunk ${chunk / 1024} KB`
@@ -186,23 +256,27 @@ export function Uploader() {
           want,
           (done) => {
             const now = performance.now();
-            if (now - lastUi > 150) {
+            if (now - lastUi > 150 && current()) {
               lastUi = now;
               update(key, { sent: done });
             }
           },
           chunk,
-          log
+          clog
         );
         const secs = Math.max((performance.now() - t0) / 1000, 0.001);
-        log(`sent ${formatBytes(stats.bytes)} to ${who} in ${secs.toFixed(1)}s · avg ${formatBytes(stats.bytes / secs)}/s`, 'ok');
-        update(key, { sent: total, state: verified.size >= count() ? 'done' : 'connected' });
+        clog(`sent ${formatBytes(stats.bytes)} to ${who} in ${secs.toFixed(1)}s · avg ${formatBytes(stats.bytes / secs)}/s`, 'ok');
+        if (current()) {
+          update(key, { sent: total, state: verified.size >= manifestRef.current.length ? 'done' : 'connected' });
+        }
       } catch (err) {
-        if (current()) update(key, { state: 'offline' });
-        log(`transfer to ${who} paused: ${(err as Error).message} · resumes when they reconnect`, 'warn');
+        if (current()) {
+          update(key, { state: 'offline' });
+          log(`transfer to ${who} paused: ${(err as Error).message} · resumes when they reconnect`, 'warn');
+        }
       } finally {
         busy = false;
-        if (queued && conn.open) {
+        if (queued && conn.open && current()) {
           const w = queued;
           queued = null;
           run(w);
@@ -211,28 +285,34 @@ export function Uploader() {
     }
 
     conn.on('data', (raw) => {
+      if (!current()) return;
       const msg = parseMsg(raw);
       if (!msg) return;
 
+      if (msg.kind === 'ping') {
+        if (conn.open) sendMsg(conn.dataChannel, { kind: 'pong' });
+        return;
+      }
+
       if (msg.kind === 'received') {
-        const wasAll = verified.size >= count();
+        const had = verified.has(msg.id);
         verified.add(msg.id);
-        const all = verified.size >= count();
+        const all = track(key, verified);
         update(key, all ? { verified: verified.size, state: 'done' } : { verified: verified.size });
-        if (all && !wasAll) log(`${who} has everything ✓`, 'ok');
+        if (all && !had) log(`${who} has everything ✓`, 'ok');
         return;
       }
 
       if (msg.kind !== 'start') return;
       if (busy) {
-        queued = msg.want; // run it as soon as the current pass ends
+        queued = msg.want;
         return;
       }
       run(msg.want);
     });
 
     conn.on('close', () => {
-      if (!current()) return; // an old connection that was replaced
+      if (!current()) return; // replaced by a newer connection from the same phone
       connsRef.current.delete(key);
       setPeers((prev) => {
         const p = prev[key];
@@ -244,14 +324,18 @@ export function Uploader() {
       log(`${who} disconnected`, 'warn');
     });
 
-    conn.on('error', (err) => log(`connection error: ${err.type}`, 'err'));
+    conn.on('error', (err) => clog(`connection error: ${err.type}`, 'err'));
   }
 
   function stop() {
+    hostGen.current++;
     peerRef.current?.destroy();
     peerRef.current = null;
+    slugRef.current = '';
     connsRef.current.clear();
     verifiedRef.current.clear();
+    pendingRef.current.clear();
+    doneRef.current.clear();
     clearSenderSession();
     setPhase('idle');
     setLink('');
@@ -260,13 +344,46 @@ export function Uploader() {
   }
 
   // ---------- effects (before any early return) ----------
-  useEffect(() => () => peerRef.current?.destroy(), []);
+  useEffect(
+    () => () => {
+      hostGen.current++;
+      peerRef.current?.destroy();
+    },
+    []
+  );
 
   useEffect(() => {
     if (phase !== 'hosting') return;
     const warn = (e: BeforeUnloadEvent) => e.preventDefault();
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
+  }, [phase]);
+
+  // Re-register with the signaling server whenever the phone wakes up or the network returns,
+  // so receivers can find this phone again.
+  useEffect(() => {
+    if (phase !== 'hosting') return;
+    const heal = () => {
+      const p = peerRef.current;
+      if (p && !p.destroyed && p.disconnected) {
+        try {
+          p.reconnect();
+        } catch {
+          // try again on the next tick
+        }
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') heal();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('online', heal);
+    const timer = setInterval(heal, 5000);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('online', heal);
+      clearInterval(timer);
+    };
   }, [phase]);
 
   useWakeLock(phase === 'hosting', log);
@@ -280,6 +397,7 @@ export function Uploader() {
       <div className="space-y-2 rounded border border-warn/40 bg-panel p-3 text-xs">
         <div>
           unfinished drop <span className="text-accent">{resume.slug}</span> · {resume.ids.length} files
+          {resume.pending.length > 0 && ` · ${resume.pending.length} still receiving`}
         </div>
         <div className="text-dim">
           re-select the same files to continue on the same link. friends who were receiving pick up where they left off.
