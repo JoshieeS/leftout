@@ -6,18 +6,19 @@ import { canShareFiles, downloadAll, isIOS, makeBatches } from '@/lib/saveToDevi
 
 type Item = { id: string; file: File; url: string };
 const isMedia = (f: File) => f.type.startsWith('image/') || f.type.startsWith('video/');
+const MAX_PER_SHARE = 50; // no size limit; only split very large drops
 
-export function SaveBar({ items, slug }: { items: Item[]; slug: string }) {
+export function SaveBar({ items, slug, ready }: { items: Item[]; slug: string; ready: boolean }) {
   const [saved, setSaved] = useState<Set<string>>(() => loadSaved(slug));
   const [busy, setBusy] = useState(false);
+  const [early, setEarly] = useState(false); // user chose to save before the transfer finished
   const [error, setError] = useState('');
 
   const pending = items.filter((i) => !saved.has(i.id));
   const media = pending.filter((i) => isMedia(i.file));
   const docs = pending.filter((i) => !isMedia(i.file));
-  // Photos and videos first. Documents go in their own batches, because a
-  // mixed batch may not offer "Save to Photos".
-  const batches = [...makeBatches(media), ...makeBatches(docs)];
+  // Photos and videos together; documents separately, since a mixed batch may not offer "Save to Photos".
+  const batches = [...makeBatches(media, MAX_PER_SHARE, Infinity), ...makeBatches(docs, MAX_PER_SHARE, Infinity)];
   const next = batches[0] ?? [];
   const useShare = isIOS() && next.length > 0 && canShareFiles(next.map((i) => i.file));
 
@@ -52,6 +53,18 @@ export function SaveBar({ items, slug }: { items: Item[]; slug: string }) {
     return <div className="text-xs text-accent">✓ all {items.length} saved to this device</div>;
   }
 
+  // While files are still arriving, wait so everything can be saved in one go.
+  if (!ready && !early) {
+    return (
+      <div className="flex items-center justify-between gap-3 text-xs text-dim">
+        <span>save to device unlocks when everything has arrived</span>
+        <button type="button" onClick={() => setEarly(true)} className="shrink-0 text-accent hover:underline">
+          save {pending.length} now
+        </button>
+      </div>
+    );
+  }
+
   const allMedia = next.every((i) => isMedia(i.file));
   const size = next.reduce((s, i) => s + i.file.size, 0);
 
@@ -63,7 +76,7 @@ export function SaveBar({ items, slug }: { items: Item[]; slug: string }) {
           onClick={share}
           className="w-full bg-accent px-4 py-3 text-bg transition-opacity hover:opacity-90"
         >
-          {allMedia ? 'save to photos' : 'save files'} · {next.length} item{next.length === 1 ? '' : 's'} ({formatBytes(size)})
+          {allMedia ? 'save all to photos' : 'save files'} · {next.length} item{next.length === 1 ? '' : 's'} ({formatBytes(size)})
         </button>
       ) : (
         <button
@@ -77,7 +90,9 @@ export function SaveBar({ items, slug }: { items: Item[]; slug: string }) {
       )}
       <div className="text-xs text-dim">
         {useShare
-          ? `${batches.length} tap${batches.length === 1 ? '' : 's'} left · in the sheet, choose “Save Images” or “Save Video”`
+          ? batches.length > 1
+            ? `${batches.length} taps left · choose “Save Images” or “Save Video” in the sheet`
+            : 'choose “Save Images” or “Save Video” in the sheet'
           : 'files go to your downloads folder'}
       </div>
       {error && <div className="text-xs text-err">{error}</div>}

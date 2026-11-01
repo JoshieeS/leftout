@@ -51,12 +51,16 @@ export default function DownloadPage() {
 
   useEffect(() => {
     let disposed = false;
+    let peerMod: typeof import('peerjs') | undefined;
     let peer: Peer | undefined;
     let conn: DataConnection | undefined;
     let sink: Sink | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let gen = 0; // bumps on every rebuild; events from older attempts are ignored
+    let retry: ReturnType<typeof setTimeout> | undefined;
     let openTimer: ReturnType<typeof setTimeout> | undefined;
+    let iceTimer: ReturnType<typeof setTimeout> | undefined;
     let attempt = 0;
+    let hiddenAt = 0;
     let rounds = 0;
     let lastUi = 0;
     let cur: Cur | null = null;
@@ -88,7 +92,6 @@ export default function DownloadPage() {
       setPerFile({ ...haveBytes });
     };
 
-    // Everything not yet verified, resuming at the last verified block.
     const wants = (): Want[] =>
       files
         .filter((f) => !verified.has(f.id))
@@ -102,8 +105,7 @@ export default function DownloadPage() {
       setReceived((r) => (r.some((x) => x.id === meta.id) ? r : [...r, { id: meta.id, file, url }]));
     }
 
-    // Work out what's already on disk. Only verified blocks are ever written,
-    // so a full-size file on disk is a complete, checked file.
+    // Only verified blocks are ever written, so a full-size file on disk is complete and checked.
     async function restore(prevVerified: Set<string>) {
       const sizes = await sink!.sizes(files.map((f) => f.id));
       verified.clear();
@@ -134,7 +136,6 @@ export default function DownloadPage() {
       log(`requesting ${w.length} file${w.length === 1 ? '' : 's'}${resumed ? ` · resuming ${resumed} mid-file` : ''}`);
     }
 
-    // Called when the user taps "download".
     startRef.current = () => {
       wantsStart = true;
       persist();
@@ -167,7 +168,7 @@ export default function DownloadPage() {
               log(`${c.meta.name}: block at ${formatBytes(block.offset)} failed verification · will resend`, 'err');
               return;
             }
-            sink!.write(buf); // only verified bytes ever reach the disk
+            sink!.write(buf);
             haveBytes[c.meta.id] = block.offset + block.size;
             refresh();
           });
@@ -195,7 +196,7 @@ export default function DownloadPage() {
                 (verified.size ? ` · ${verified.size} already here` : ''),
               'ok'
             );
-            verified.forEach((id) => send({ kind: 'received', id })); // keep the sender's view accurate
+            verified.forEach((id) => send({ kind: 'received', id }));
             if (wantsStart) requestFiles();
             else if (phaseRef.current !== 'done') go('connected');
           });
@@ -249,7 +250,7 @@ export default function DownloadPage() {
         case 'complete': {
           q(() => {
             if (!wants().length) return finish();
-            if (++rounds <= 3) return requestFiles(); // resend anything that failed the check
+            if (++rounds <= 3) return requestFiles();
             go('error');
             log('some files kept failing verification', 'err');
           });
@@ -258,93 +259,137 @@ export default function DownloadPage() {
       }
     }
 
-    // ---- connection + automatic reconnect ----
-    function onDrop(reason: string) {
-      if (disposed || phaseRef.current === 'done') return;
+    // ---------- connection ----------
+    // Kill the current attempt completely. Bumping `gen` first means any events
+    // the old peer fires while being destroyed are ignored.
+    function teardown() {
+      gen++;
+      clearTimeout(retry);
+      clearTimeout(openTimer);
+      clearTimeout(iceTimer);
+      retry = openTimer = iceTimer = undefined;
       const c = cur;
       cur = null;
-      if (c) q(() => sink!.close()); // keep verified blocks, discard the half-received one
+      if (c) q(() => sink?.close()); // keep verified blocks, drop the half-received one
+      const oldConn = conn;
+      const oldPeer = peer;
+      conn = undefined;
+      peer = undefined;
+      try { oldConn?.close(); } catch {}
+      try { oldPeer?.destroy(); } catch {}
+    }
+
+    // Start from scratch with a brand-new peer: the same thing a page refresh does.
+    function rebuild() {
+      if (disposed || !peerMod || phaseRef.current === 'done') return;
+      teardown();
+      const my = gen;
+      const live = () => !disposed && my === gen;
+
+      const p = new peerMod.Peer({ config: { iceServers: ICE_SERVERS } });
+      peer = p;
+
+      p.on('open', () => {
+        if (!live()) return;
+        log(`dialing ${slug}…`);
+        const c = p.connect(slug, { reliable: true, serialization: 'raw', metadata: { client: clientId() } });
+        conn = c;
+        traceConnection(c, log);
+
+        openTimer = setTimeout(() => {
+          if (live() && !c.open) fail('connection timed out');
+        }, 15000);
+
+        c.on('open', () => {
+          if (!live()) return;
+          clearTimeout(openTimer);
+          attempt = 0;
+          c.dataChannel.binaryType = 'arraybuffer';
+          const ph = phaseRef.current;
+          if (ph === 'reconnecting' || ph === 'waiting') log('reconnected', 'ok');
+          if (ph !== 'done') go('connected'); // the manifest that follows resumes the transfer
+        });
+        c.on('data', (d) => {
+          if (live()) onData(d);
+        });
+        c.on('close', () => {
+          if (live()) fail('connection closed');
+        });
+        c.on('error', () => {
+          if (live()) fail('connection error');
+        });
+        // A network drop can leave the channel "open" but dead. Give it 5s to recover.
+        c.on('iceStateChanged', (s) => {
+          if (!live()) return;
+          if (s === 'disconnected') {
+            clearTimeout(iceTimer);
+            iceTimer = setTimeout(() => {
+              if (live()) fail('network lost');
+            }, 5000);
+          } else if (s === 'connected' || s === 'completed') {
+            clearTimeout(iceTimer);
+          } else if (s === 'failed' || s === 'closed') {
+            fail('network failed');
+          }
+        });
+      });
+
+      // Losing the signaling server doesn't matter while the data channel is up.
+      p.on('disconnected', () => {
+        if (live() && !conn?.open) fail('signaling lost');
+      });
+
+      p.on('error', (err) => {
+        if (!live()) return;
+        if (err.type === 'peer-unavailable') fail('sender offline', true);
+        else fail(`signaling: ${err.type}`);
+      });
+    }
+
+    // One place handles every failure, and only one retry is ever scheduled.
+    function fail(reason: string, senderOffline = false) {
+      if (disposed || phaseRef.current === 'done') return;
+      teardown();
       refresh(true);
-      if (phaseRef.current !== 'reconnecting' && phaseRef.current !== 'waiting') {
-        log(`${reason} · reconnecting, progress is saved`, 'warn');
+      const next: Phase = senderOffline ? 'waiting' : 'reconnecting';
+      if (phaseRef.current !== next) {
+        log(senderOffline ? 'sender is offline · will keep trying' : `${reason} · reconnecting, progress is saved`, 'warn');
       }
-      go(phaseRef.current === 'waiting' ? 'waiting' : 'reconnecting');
-      scheduleReconnect();
-    }
-
-    // Retry after 1s, 2s, 4s, 8s, then every 15s.
-    function scheduleReconnect() {
-      if (disposed || timer) return;
-      const delay = Math.min(1000 * 2 ** attempt, 15000);
+      go(next);
+      const delay = senderOffline ? 8000 : Math.min(1000 * 2 ** attempt, 15000);
       attempt++;
-      timer = setTimeout(() => {
-        timer = undefined;
-        connect();
-      }, delay);
+      retry = setTimeout(rebuild, delay);
     }
 
-    function connect() {
-      if (disposed || !peer || peer.destroyed) return;
-      if (peer.disconnected) {
-        // Lost the signaling server too: reconnect it first; its 'open' event dials again.
-        try {
-          peer.reconnect();
-        } catch {
-          scheduleReconnect();
-        }
+    // Coming back from the background: iOS froze everything, so rebuild immediately.
+    function kick(why: string) {
+      if (disposed || !peerMod || phaseRef.current === 'done') return;
+      log(`${why} · reconnecting`);
+      if (phaseRef.current !== 'waiting') go('reconnecting');
+      attempt = 0;
+      rebuild();
+    }
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenAt = Date.now();
         return;
       }
-
-      conn?.close();
-      clearTimeout(openTimer);
-      log(`dialing ${slug}…`);
-      const c = peer.connect(slug, { reliable: true, serialization: 'raw', metadata: { client: clientId() } });
-      conn = c;
-      traceConnection(c, log);
-
-      // If the channel never opens, treat it as a drop and try again.
-      openTimer = setTimeout(() => {
-        if (conn === c && !c.open) {
-          c.close();
-          onDrop('connection timed out');
-        }
-      }, 20000);
-
-      c.on('open', () => {
-        if (conn !== c) return;
-        clearTimeout(openTimer);
-        attempt = 0;
-        c.dataChannel.binaryType = 'arraybuffer';
-        const p = phaseRef.current;
-        if (p === 'reconnecting' || p === 'waiting') log('reconnected', 'ok');
-        if (p !== 'done') go('connected'); // the manifest that follows resumes the transfer
-      });
-      c.on('data', (d) => {
-        if (conn === c) onData(d);
-      });
-      c.on('close', () => {
-        if (conn === c) onDrop('connection closed');
-      });
-      c.on('error', () => {
-        if (conn === c) onDrop('connection error');
-      });
-    }
-
-    // Reconnect straight away when the tab comes back or the network returns.
-    const kick = () => {
-      if (disposed || !peer || phaseRef.current === 'done' || conn?.open) return;
-      clearTimeout(timer);
-      timer = undefined;
-      attempt = 0;
-      connect();
+      const away = hiddenAt ? Date.now() - hiddenAt : 0;
+      hiddenAt = 0;
+      if (away > 3000 || !conn?.open) kick('back in foreground');
     };
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') kick();
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (e.persisted) kick('page restored');
     };
-    document.addEventListener('visibilitychange', onVisible);
-    window.addEventListener('online', kick);
+    const onOnline = () => {
+      if (!conn?.open) kick('network back');
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('online', onOnline);
 
-    // ---- start up ----
+    // ---------- start up ----------
     (async () => {
       sink = await createSink(slug, (m) => log(`storage error: ${m}`, 'err'));
       if (disposed) return sink.dispose();
@@ -362,51 +407,19 @@ export default function DownloadPage() {
       }
       setStarted(wantsStart);
 
-      const mod = await import('peerjs');
-      if (disposed) return;
-      if (phaseRef.current !== 'done') go('connecting');
-
+      peerMod = await import('peerjs');
+      if (disposed || phaseRef.current === 'done') return;
+      go('connecting');
       log('requesting peer id…');
-      peer = new mod.Peer({ config: { iceServers: ICE_SERVERS } });
-
-      peer.on('open', () => {
-        if (!conn?.open) connect();
-      });
-
-      peer.on('disconnected', () => {
-        if (disposed || peer!.destroyed) return;
-        try {
-          peer!.reconnect();
-        } catch {
-          // the error handler schedules the next attempt
-        }
-      });
-
-      peer.on('error', (err) => {
-        if (err.type === 'peer-unavailable') {
-          clearTimeout(openTimer);
-          if (phaseRef.current === 'done') return;
-          if (phaseRef.current !== 'waiting') log('sender is offline · will keep trying', 'warn');
-          go('waiting');
-          attempt = Math.max(attempt, 3); // check every ~8–15s while waiting
-          scheduleReconnect();
-          return;
-        }
-        if (['network', 'server-error', 'socket-error', 'socket-closed', 'disconnected'].includes(err.type)) {
-          onDrop(`signaling: ${err.type}`);
-          return;
-        }
-        log(`error: ${err.type}`, 'err');
-      });
+      rebuild();
     })();
 
     return () => {
       disposed = true;
-      clearTimeout(timer);
-      clearTimeout(openTimer);
-      document.removeEventListener('visibilitychange', onVisible);
-      window.removeEventListener('online', kick);
-      peer?.destroy();
+      teardown();
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('online', onOnline);
       sink?.dispose();
       urls.forEach((u) => URL.revokeObjectURL(u));
     };
@@ -452,7 +465,7 @@ export default function DownloadPage() {
 
       {started && manifest.length > 0 && phase !== 'done' && <AsciiProgress value={bytes} total={total} />}
 
-      <SaveBar items={gallery} slug={slug} />
+      <SaveBar items={gallery} slug={slug} ready={phase === 'done'} />
 
       {manifest.length > 0 && (
         <div className="rounded border border-line bg-panel">
