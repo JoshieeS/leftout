@@ -24,7 +24,7 @@ export function FileList({ files, onRemove }: Props) {
         {files.map((f, i) => (
           <li key={`${f.name}-${f.size}-${f.lastModified}`} className="flex items-center gap-3 px-3 py-2">
             {previews[i]
-              ? createElement(Thumb, { src: previews[i], video: isVideo(f) })
+              ? createElement(Thumb, { src: previews[i], type: f.type, name: f.name })
               : createElement('div', { className: 'size-10 shrink-0 rounded bg-line' })}
 
             <span className="min-w-0 flex-1 truncate">{f.name}</span>
