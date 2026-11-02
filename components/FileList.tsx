@@ -17,14 +17,15 @@ export function FileList({ files, onRemove }: Props) {
 
   const total = files.reduce((sum, f) => sum + f.size, 0);
   const videos = files.filter(isVideo).length;
+  const lite = files.length > 12; // many files: skip live video previews to save memory
 
   return (
     <div className="rounded border border-line bg-panel">
-      <ul className="divide-y divide-line">
+      <ul className="max-h-80 divide-y divide-line overflow-y-auto">
         {files.map((f, i) => (
           <li key={`${f.name}-${f.size}-${f.lastModified}`} className="flex items-center gap-3 px-3 py-2">
             {previews[i]
-              ? createElement(Thumb, { src: previews[i], type: f.type, name: f.name })
+              ? createElement(Thumb, { src: previews[i], type: f.type, name: f.name, lite })
               : createElement('div', { className: 'size-10 shrink-0 rounded bg-line' })}
 
             <span className="min-w-0 flex-1 truncate">{f.name}</span>
@@ -33,6 +34,7 @@ export function FileList({ files, onRemove }: Props) {
 
             {onRemove && (
               <button
+                type="button"
                 onClick={() => onRemove(i)}
                 aria-label={`remove ${f.name}`}
                 className="shrink-0 px-1 text-dim hover:text-err"

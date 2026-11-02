@@ -25,6 +25,7 @@ const OPEN_TIMEOUT = 12000; // give up on a dial that never opens
 const PING_EVERY = 5000;    // when nothing has arrived for this long, ask the sender
 const PROBE_WAIT = 4000;    // after returning to the tab, how long to wait for any reply
 const STALL_AFTER = 20000;  // no data at all for this long → reconnect
+const LITE_AFTER = 12;      // above this many received files, use light video tiles
 
 const statusText: Record<Phase, string> = {
   loading: 'loading',
@@ -46,6 +47,7 @@ export default function DownloadPage() {
   const [perFile, setPerFile] = useState<Record<string, number>>({});
   const [received, setReceived] = useState<Got[]>([]);
   const [started, setStarted] = useState(false);
+  const [space, setSpace] = useState<{ free: number; need: number } | null>(null);
   const phaseRef = useRef<Phase>('loading');
   const startRef = useRef<() => void>(() => {});
 
@@ -68,6 +70,7 @@ export default function DownloadPage() {
     let forceFresh = false; // next attempt must register a new peer
     let lastRx = 0;
     let lastPing = 0;
+    let lastStallLog = 0;
     let probeAt = 0;
     let hiddenAt = 0;
     let rounds = 0;
@@ -126,9 +129,25 @@ export default function DownloadPage() {
       }
     }
 
+    // Is there room on this device for what's still missing?
+    async function checkSpace() {
+      const need = files.reduce(
+        (s, f) => s + (verified.has(f.id) ? 0 : f.size - Math.min(haveBytes[f.id] ?? 0, f.size)),
+        0
+      );
+      if (!need) return setSpace(null);
+      const est = await navigator.storage?.estimate?.().catch(() => undefined);
+      if (!est?.quota) return;
+      const free = est.quota - (est.usage ?? 0);
+      const short = free < need;
+      log(`storage: ${formatBytes(free)} available · ${formatBytes(need)} needed`, short ? 'err' : 'info');
+      setSpace(short ? { free, need } : null);
+    }
+
     function finish() {
       if (phaseRef.current === 'done') return;
       go('done');
+      setSpace(null);
       refresh(true);
       log(`all ${files.length} files received and verified ✓`, 'ok');
     }
@@ -139,6 +158,7 @@ export default function DownloadPage() {
       if (!conn?.open) return;
       send({ kind: 'start', want: w });
       go('receiving');
+      lastRx = Date.now();
       const resumed = w.filter((x) => x.offset > 0).length;
       log(`requesting ${w.length} file${w.length === 1 ? '' : 's'}${resumed ? ` · resuming ${resumed} mid-file` : ''}`);
     }
@@ -198,6 +218,7 @@ export default function DownloadPage() {
             await restore(prev);
             persist();
             refresh(true);
+            await checkSpace();
             const total = files.reduce((s, f) => s + f.size, 0);
             log(
               `manifest: ${files.length} files, ${formatBytes(total)}` +
@@ -415,10 +436,17 @@ export default function DownloadPage() {
       retry = setTimeout(connectNow, delay);
     }
 
-    // Detects connections that look open but are dead (common after iOS suspends the tab).
+    // Detects connections that look open but are dead (common after iOS suspends the tab),
+    // and logs when the sender stops sending.
     const watchdog = setInterval(() => {
       if (disposed || phaseRef.current === 'done' || !conn?.open) return;
       const now = Date.now();
+
+      if (phaseRef.current === 'receiving' && now - lastRx > 8000 && now - lastStallLog > 4000) {
+        lastStallLog = now;
+        log(`no data for ${Math.round((now - lastRx) / 1000)}s · waiting on ${cur ? cur.meta.name : 'the next file'}`, 'warn');
+      }
+
       if (probeAt) {
         if (lastRx >= probeAt) probeAt = 0; // got a reply: the connection survived
         else if (now - probeAt > PROBE_WAIT) fail('no reply after returning', { fresh: true });
@@ -515,6 +543,7 @@ export default function DownloadPage() {
   const doneIds = new Set(received.map((r) => r.id));
   const order = new Map(manifest.map((f, i) => [f.id, i]));
   const gallery = [...received].sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+  const lite = gallery.length > LITE_AFTER;
 
   const tone =
     phase === 'done'
@@ -534,6 +563,13 @@ export default function DownloadPage() {
       </h1>
 
       <div className={tone}>{statusText[phase]}</div>
+
+      {space && (
+        <div className="rounded border border-err/40 bg-panel p-3 text-xs leading-relaxed text-err">
+          not enough space for this drop · {formatBytes(space.free)} available, {formatBytes(space.need)} needed.
+          free up space on this phone, then reload this page. finished files are kept.
+        </div>
+      )}
 
       {phase === 'connected' && !started && manifest.length > 0 && (
         <button
@@ -580,7 +616,7 @@ export default function DownloadPage() {
         <ul className="grid grid-cols-3 gap-2">
           {gallery.map((r) => (
             <li key={r.id} className="min-w-0 space-y-1">
-              {createElement(Thumb, { src: r.url, type: r.file.type, name: r.file.name, large: true })}
+              {createElement(Thumb, { src: r.url, type: r.file.type, name: r.file.name, large: true, lite })}
               {createElement(
                 'a',
                 { href: r.url, download: r.file.name, className: 'block truncate text-xs text-accent hover:underline' },
